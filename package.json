@@ -1,0 +1,21 @@
+{
+  "name": "@butler/table-operations",
+  "version": "1.0.0",
+  "description": "Table and KOT management operations for Butler POS",
+  "main": "src/index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "test": "jest"
+  },
+  "dependencies": {
+    "@butler/order-engine": "^1.0.0",
+    "pg": "^8.11.3",
+    "redis": "^4.6.13"
+  },
+  "peerDependencies": {
+    "express": "^4.18.0"
+  },
+  "files": [
+    "src"
+  ]
+} 
