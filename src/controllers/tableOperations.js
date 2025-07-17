@@ -347,14 +347,37 @@ const moveItems = async (data) => {
     }
 
     // Create/update order on new table
-    const mockReq = {
-      body: {
-        restaurantId,
-        tableId: newTableId,
-        items: itemsForNewTable,
-        orderType: 'captain'
-      }
-    };
+    // First check if destination table has an order with print_status true
+    const destOrderResult = await pool.query(
+      `SELECT id, print_status FROM orders 
+       WHERE restaurant_id = $1 AND table_id = $2`,
+      [restaurantId, newTableId]
+    );
+
+    let mockReq;
+    if (destOrderResult.rows.length > 0 && destOrderResult.rows[0].print_status === true) {
+      // Destination table has a printed order - create a new order instead of merging
+      console.log("Destination table has printed order, creating new order");
+      mockReq = {
+        body: {
+          restaurantId,
+          tableId: newTableId,
+          items: itemsForNewTable,
+          orderType: 'captain',
+          forceNewOrder: true // Flag to indicate we want a new order
+        }
+      };
+    } else {
+      // Normal case - merge with existing order or create new one
+      mockReq = {
+        body: {
+          restaurantId,
+          tableId: newTableId,
+          items: itemsForNewTable,
+          orderType: 'captain'
+        }
+      };
+    }
 
     const mockRes = {
       status: (code) => ({
@@ -381,102 +404,107 @@ const moveItems = async (data) => {
 const moveTable = async (data) => {
   try {
     const { oldTableId, newTableId, restaurantId, orderId } = data;
-    
     if (!oldTableId || !newTableId || !restaurantId) {
       throw new Error('Missing required fields');
     }
 
-    let itemsTobePrinted = {};
-
-    // Check if destination table has existing orders and merge if needed
-    const existingOrderCheck = await pool.query(
-      'SELECT id, json_data, instructions FROM orders WHERE restaurant_id = $1 AND table_id = $2',
+    // 1. Fetch destination + source orders, now including print_status
+    const destRes = await pool.query(
+      `SELECT id, json_data, instructions, print_status
+         FROM orders
+        WHERE restaurant_id = $1
+          AND table_id      = $2`,
       [restaurantId, newTableId]
     );
-
-    const sourceOrderCheck = await pool.query(
-      'SELECT id, json_data, instructions FROM orders WHERE restaurant_id = $1 AND table_id = $2',
+    const srcRes = await pool.query(
+      `SELECT id, json_data, instructions
+         FROM orders
+        WHERE restaurant_id = $1
+          AND table_id      = $2`,
       [restaurantId, oldTableId]
     );
 
-    // Case 1: Both tables have orders - merge them
-    if (existingOrderCheck.rows.length > 0 && sourceOrderCheck.rows.length > 0) {
-      const existingOrder = existingOrderCheck.rows[0];
-      const sourceOrder = sourceOrderCheck.rows[0];
-      
-      // Merge items
-      const existingItems = existingOrder.json_data.items || {};
-      const sourceItems = sourceOrder.json_data.items || {};
-      const mergedItems = { ...existingItems };
+    // 2. Both tables have orders?
+    if (destRes.rows.length > 0 && srcRes.rows.length > 0) {
+      const destOrder = destRes.rows[0];
+      const srcOrder  = srcRes.rows[0];
 
-      // Combine items and their customizations
-      for (const [itemId, itemData] of Object.entries(sourceItems)) {
-        if (mergedItems[itemId]) {
-          // Item exists in both orders, merge customizations
-          mergedItems[itemId].customizations = [
-            ...mergedItems[itemId].customizations,
-            ...itemData.customizations
-          ];
-        } else {
-          // New item, add it to merged items
-          mergedItems[itemId] = itemData;
+      // 2a. Destination NOT printed → MERGE (your existing logic)
+      if (!destOrder.print_status) {
+        const existingItems = destOrder.json_data.items || {};
+        const sourceItems   = srcOrder.json_data.items   || {};
+        const mergedItems   = { ...existingItems };
+
+        for (const [itemId, itemData] of Object.entries(sourceItems)) {
+          if (mergedItems[itemId]) {
+            mergedItems[itemId].customizations = [
+              ...mergedItems[itemId].customizations,
+              ...itemData.customizations
+            ];
+          } else {
+            mergedItems[itemId] = itemData;
+          }
         }
+        const mergedInstructions = [
+          destOrder.instructions,
+          srcOrder.instructions
+        ].filter(Boolean).join('\n');
+
+        await pool.query(
+          `UPDATE orders
+              SET json_data   = $1,
+                  instructions = $2,
+                  updated_at    = CURRENT_TIMESTAMP
+            WHERE id = $3`,
+          [{ items: mergedItems }, mergedInstructions, destOrder.id]
+        );
+
+        await pool.query(
+          `UPDATE notifications
+              SET order_id     = $1,
+                  table_number = $2,
+                  updated_at   = CURRENT_TIMESTAMP
+            WHERE restaurant_id = $3
+              AND order_id       = $4
+              AND active         = true`,
+          [destOrder.id, newTableId, restaurantId, srcOrder.id]
+        );
+
+        await pool.query(
+          `UPDATE order_customization_deliveries
+              SET order_id = $1
+            WHERE order_id = $2`,
+          [destOrder.id, srcOrder.id]
+        );
+
+        // delete the old source order
+        await pool.query(`DELETE FROM orders WHERE id = $1`, [srcOrder.id]);
       }
-
-      // Merge instructions if any
-      const mergedInstructions = [
-        existingOrder.instructions,
-        sourceOrder.instructions
-      ].filter(Boolean).join('\n');
-
-      // Update the destination order with merged data
-      await pool.query(
-        'UPDATE orders SET json_data = $1, instructions = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3',
-        [{ items: mergedItems }, mergedInstructions, existingOrder.id]
-      );
-
-      // Update notifications to point to the destination order
-      const notificationUpdateResult = await pool.query(
-        `UPDATE notifications 
-         SET order_id = $1,
-             table_number = $2,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE restaurant_id = $3 
-         AND order_id = $4 
-         AND active = true
-         RETURNING notification_id`,
-        [existingOrder.id, newTableId, restaurantId, sourceOrder.id]
-      );
-
-      console.log(`Updated ${notificationUpdateResult.rowCount} notifications from order ${sourceOrder.id} to ${existingOrder.id}`);
-
-      // Update order_customization_deliveries to point to the destination order
-      const deliveryUpdateResult = await pool.query(
-        `UPDATE order_customization_deliveries 
-         SET order_id = $1
-         WHERE order_id = $2
-         RETURNING id`,
-        [existingOrder.id, sourceOrder.id]
-      );
-
-      console.log(`Updated ${deliveryUpdateResult.rowCount} delivery records from order ${sourceOrder.id} to ${existingOrder.id}`);
-
-      // Delete the source order since it's now merged
-      await pool.query(
-        'DELETE FROM orders WHERE id = $1',
-        [sourceOrder.id]
-      );
+      // 2b. Destination **printed** → REUSE source.id (Option A)
+      else {
+        // simply move the row
+        await pool.query(
+          `UPDATE orders
+              SET table_id   = $1,
+                  updated_at = CURRENT_TIMESTAMP
+            WHERE id         = $2`,
+          [newTableId, srcRes.rows[0].id]
+        );
+        // (no need to touch notifications here — step 4 handles them)
+      }
     }
-    // Case 2: Only source table has order - simple move
-    else if (sourceOrderCheck.rows.length > 0) {
-      // Simply update the table_id of the order
+    // 3. Only source has an order → simple move
+    else if (srcRes.rows.length > 0) {
       await pool.query(
-        'UPDATE orders SET table_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-        [newTableId, sourceOrderCheck.rows[0].id]
+        `UPDATE orders
+            SET table_id   = $1,
+                updated_at = CURRENT_TIMESTAMP
+          WHERE id         = $2`,
+        [newTableId, srcRes.rows[0].id]
       );
     }
 
-    // Continue with the rest of the move operations
+    // 4. Update ALL related tables exactly as before
     const [
       notificationsUpdate,
       otpUpdate,
@@ -485,48 +513,58 @@ const moveTable = async (data) => {
       captainsUpdate
     ] = await Promise.all([
       pool.query(
-        'UPDATE notifications SET table_number=$1 WHERE restaurant_id=$2 AND table_number=$3 AND active=true',
+        `UPDATE notifications
+            SET table_number = $1
+          WHERE restaurant_id = $2
+            AND table_number  = $3
+            AND active        = true`,
         [newTableId, restaurantId, oldTableId]
       ),
       pool.query(
-        'UPDATE table_otps SET table_id=$1 WHERE restaurant_id=$2 AND table_id=$3',
+        `UPDATE table_otps
+            SET table_id = $1
+          WHERE restaurant_id = $2
+            AND table_id      = $3`,
         [newTableId, restaurantId, oldTableId]
       ),
       pool.query(
-        'UPDATE discounts SET table_number=$1, updated_at=CURRENT_TIMESTAMP WHERE restaurant_id=$2 AND table_number=$3 AND is_active=true',
+        `UPDATE discounts
+            SET table_number = $1,
+                updated_at   = CURRENT_TIMESTAMP
+          WHERE restaurant_id = $2
+            AND table_number  = $3
+            AND is_active     = true`,
         [newTableId, restaurantId, oldTableId]
       ),
       pool.query(
-        'UPDATE dynamic_offers SET table_id=$1 WHERE restaurant_id=$2 AND order_id=$3 AND table_id=$4 AND active=true',
+        `UPDATE dynamic_offers
+            SET table_id = $1
+          WHERE restaurant_id = $2
+            AND order_id      = $3
+            AND table_id      = $4
+            AND active        = true`,
         [newTableId, restaurantId, orderId, oldTableId]
       ),
       pool.query(
         `UPDATE captains
-         SET assigned_tables = (
-           SELECT jsonb_agg(DISTINCT CASE
-             WHEN value = to_jsonb($1::text) THEN to_jsonb($2::text)
-             ELSE value END
-           )
-           FROM jsonb_array_elements(assigned_tables) AS arr(value)
-         )
-         WHERE restaurant_id=$3
-           AND assigned_tables @> to_jsonb($1::text)`,
+            SET assigned_tables = (
+              SELECT jsonb_agg(DISTINCT CASE
+                WHEN value = to_jsonb($1::text) THEN to_jsonb($2::text)
+                ELSE value END
+              )
+              FROM jsonb_array_elements(assigned_tables) AS arr(value)
+            )
+          WHERE restaurant_id   = $3
+            AND assigned_tables @> to_jsonb($1::text)`,
         [oldTableId, newTableId, restaurantId]
       )
     ]);
 
+    // 5. Migrate sessions
     await migrateTableSessions(restaurantId, oldTableId, newTableId);
 
-    // Send notifications
-    await sendNotificationToRestaurant(
-      '',
-      '',
-      { tableId: oldTableId },
-      restaurantId,
-      'captain',
-      true
-    );
-
+    // 6. Send notifications
+    await sendNotificationToRestaurant('', '', { tableId: oldTableId }, restaurantId, 'captain', true);
     await sendNotificationToRestaurant(
       'Table Move Completed',
       `Table move from ${oldTableId} to ${newTableId} completed.`,
@@ -535,6 +573,7 @@ const moveTable = async (data) => {
       'biller'
     );
 
+    // 7. Return summary
     return {
       success: true,
       message: 'Table moved successfully',
@@ -545,12 +584,13 @@ const moveTable = async (data) => {
       dynamicOffersUpdated: dynamicOffersUpdate.rowCount,
       captainsUpdated: captainsUpdate.rowCount,
     };
-
   } catch (error) {
     console.error('Error moving table:', error);
     throw error;
   }
 };
+
+
 
 const moveKOT = async (data) => {
   try {
@@ -606,6 +646,13 @@ const moveKOT = async (data) => {
       itemsToPrint[d.item_id].customizations.push(d.customization_details);
     }
 
+    // Check if destination table has an order with print_status true
+    const destOrderResult = await pool.query(
+      `SELECT id, print_status FROM orders 
+       WHERE restaurant_id = $1 AND table_id = $2`,
+      [restaurantId, newTableId]
+    );
+
     // Create a mock request and response object for createOrUpdateOrder
     const mockReq = {
       body: {
@@ -613,7 +660,8 @@ const moveKOT = async (data) => {
         tableId: newTableId,
         items: itemsToPrint,
         orderId,
-        orderType: 'captain'
+        orderType: 'captain',
+        forceNewOrder: destOrderResult.rows.length > 0 && destOrderResult.rows[0].print_status === true
       }
     };
 
