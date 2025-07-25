@@ -598,35 +598,51 @@ const moveTable = async (data) => {
 
 
 
-const moveKOT = async (data) => {
+const moveKOT = async (reqOrData, res) => {
   try {
-    const { oldTableId, newTableId, restaurantId, orderId, notificationIds } = data;
-
-    // Validate inputs
-    if (!oldTableId || !newTableId || !restaurantId || !orderId || !Array.isArray(notificationIds)) {
-      throw new Error('Missing required fields');
+    // Support both (req, res) and (data) signatures
+    let oldTableId, newTableId, restaurantId, orderId, notificationIds;
+    let isExpress = false;
+    if (reqOrData && reqOrData.body) {
+      // Express handler style
+      isExpress = true;
+      ({ oldTableId, newTableId, restaurantId, orderId, notificationIds } = reqOrData.body);
+    } else {
+      // Utility style
+      ({ oldTableId, newTableId, restaurantId, orderId, notificationIds } = reqOrData);
     }
 
-    // Count total KOT notifications on this order
+    // 0. Validate inputs
+    if (!oldTableId || !newTableId || !restaurantId || !orderId || !Array.isArray(notificationIds)) {
+      if (isExpress && res) {
+        return res.status(400).json({ error: 'Missing required fields' });
+      } else {
+        return { success: false, error: 'Missing required fields' };
+      }
+    }
+
+    // 1. Count total KOT notifications on this order
     const { rows: [{ total }] } = await pool.query(
       `SELECT COUNT(*)::int AS total
          FROM notifications
         WHERE restaurant_id = $1
-          AND order_id = $2
+          AND order_id       = $2
           AND action_type IN ('order_created','order-updated')
           AND active = true`,
       [restaurantId, orderId]
     );
-
     console.log("Total notifications on this order:", total);
-
-    // If all notifications are being moved, delegate to moveTable
+    // 2. If all notifications are being moved, delegate to moveTable
     if (notificationIds.length === total) {
-      console.log("Moving table since all KOTs are being moved");
-      return moveTable(data);
+      console.log("Moving table Since all KOTs are being moved");
+      if (isExpress && res) {
+        return moveTable({ oldTableId, newTableId, restaurantId, orderId });
+      } else {
+        return moveTable({ oldTableId, newTableId, restaurantId, orderId });
+      }
     }
 
-    // Otherwise, update only the selected notifications
+    // 3. Otherwise, update only the selected notifications
     await pool.query(
       `DELETE FROM notifications
         WHERE restaurant_id = $1
@@ -635,15 +651,16 @@ const moveKOT = async (data) => {
       [restaurantId, orderId, notificationIds]
     );
 
-    // Re-print just this one order on the new table
+    // 4. Re-print just this one order on the new table
+    //    fetch all items/customizations for the order
     const { rows: deliveries } = await pool.query(
       `SELECT item_id, customization_details
          FROM order_customization_deliveries
         WHERE notification_id = ANY($1::text[])`,
-      [notificationIds.map(String)]
+      [ notificationIds.map(String) ]
     );
 
-    // Build items object and call createOrUpdateOrder
+    // 5. Build items object and call createOrUpdateOrder
     const itemsToPrint = {};
     for (const d of deliveries) {
       if (!itemsToPrint[d.item_id]) {
@@ -651,6 +668,7 @@ const moveKOT = async (data) => {
       }
       itemsToPrint[d.item_id].customizations.push(d.customization_details);
     }
+    
 
     // Check if destination table has any non-printed orders to merge with
     const destOrderResult = await pool.query(
@@ -660,32 +678,50 @@ const moveKOT = async (data) => {
       [restaurantId, newTableId]
     );
 
-    // Check if there's a non-printed order to merge with
+    let mockReq;
     const nonPrintedOrder = destOrderResult.rows.find(order => order.print_status !== true);
 
-    // Create a mock request and response object for createOrUpdateOrder
-    const mockReq = {
-      body: {
-        restaurantId,
-        tableId: newTableId,
-        items: itemsToPrint,
-        orderId,
-        orderType: 'captain',
-        forceNewOrder: destOrderResult.rows.length > 0 && !nonPrintedOrder
-      }
-    };
+    if (destOrderResult.rows.length > 0 && !nonPrintedOrder) {
+      // All orders on destination table are printed - create a new order
+      mockReq = {
+        body: {
+          restaurantId,
+          tableId: newTableId,
+          items: itemsToPrint,
+          orderType: 'captain',
+          forceNewOrder: true
+        },
+        app: { get: () => undefined }
+      };
+    } else if (nonPrintedOrder) {
+      // Merge with existing non-printed order
+      mockReq = {
+        body: {
+          restaurantId,
+          tableId: newTableId,
+          items: itemsToPrint,
+          orderType: 'captain',
+          orderId: nonPrintedOrder.id
+        },
+        app: { get: () => undefined }
+      };
+    } else {
+      // No orders on destination table - create new order
+      mockReq = {
+        body: {
+          restaurantId,
+          tableId: newTableId,
+          items: itemsToPrint,
+          orderType: 'captain'
+        },
+        app: { get: () => undefined }
+      };
+    }
 
-    const mockRes = {
-      status: (code) => ({
-        json: (data) => {
-          console.log('Order update response:', { code, data });
-          return data;
-        }
-      })
-    };
-
-    // Call the imported createOrUpdateOrder function
-    await createOrUpdateOrder(mockReq, mockRes);
+    await createOrUpdateOrder(
+      mockReq,
+      { status: () => ({ json: () => {} }) }
+    );
 
     await pool.query(
       `DELETE FROM order_customization_deliveries
@@ -693,40 +729,39 @@ const moveKOT = async (data) => {
       [notificationIds.map(String)]
     );
 
-    // Remove the same items from the old table's order
+    // 6. Remove the same items from the old table's order
     const { rows: oldOrders } = await pool.query(
       `SELECT * FROM orders WHERE restaurant_id = $1 AND id = $2`,
       [restaurantId, orderId]
     );
-
     if (oldOrders.length) {
       const oldOrder = oldOrders[0];
       const oldItems = oldOrder.json_data.items;
 
-      // Build a map of items and customizations to remove
+      // Build a map of items and customizations to remove (from deliveries)
       for (const d of deliveries) {
         const itemId = d.item_id;
         const moveCustom = d.customization_details;
         if (oldItems[itemId]) {
           const oldCustoms = oldItems[itemId].customizations;
-          
+          // Helper to compare customizations (variation + addons)
           const isSameCustomization = (a, b) => {
             return JSON.stringify(a.variation) === JSON.stringify(b.variation)
               && JSON.stringify(a.addons) === JSON.stringify(b.addons);
           };
-
           for (let i = 0; i < oldCustoms.length; i++) {
             if (isSameCustomization(moveCustom, oldCustoms[i])) {
+              // Use qtyChange if present, else qty
               const qtyToRemove = moveCustom.qtyChange !== undefined ? moveCustom.qtyChange : moveCustom.qty;
               oldCustoms[i].qty -= qtyToRemove;
               if (oldCustoms[i].qty <= 0) {
                 oldCustoms.splice(i, 1);
-                i--;
+                i--; // adjust index after removal
               }
               break;
             }
           }
-
+          // If no customizations left, remove the item
           if (oldCustoms.length === 0) {
             delete oldItems[itemId];
           } else {
@@ -735,22 +770,26 @@ const moveKOT = async (data) => {
           }
         }
       }
-
       // Save the updated order
       await pool.query(
         `UPDATE orders SET json_data = $1, updated_at = NOW() WHERE id = $2`,
-        [{ items: oldItems }, oldOrder.id]
+        [JSON.stringify({ items: oldItems }), oldOrder.id]
       );
     }
 
-    return {
-      success: true,
-      message: 'KOT moved successfully'
-    };
+    if (isExpress && res) {
+      return res.status(200).json({ message: 'KOT moved successfully' });
+    } else {
+      return { success: true, message: 'KOT moved successfully' };
+    }
 
-  } catch (error) {
-    console.error('Error moving KOT:', error);
-    throw error;
+  } catch (err) {
+    console.error('Error moving KOT:', err);
+    if (isExpress && res) {
+      return res.status(500).json({ error: 'Internal server error' });
+    } else {
+      return { success: false, error: err?.message || 'Internal server error' };
+    }
   }
 };
 
