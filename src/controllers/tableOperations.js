@@ -421,11 +421,23 @@ const moveTable = async (data) => {
          ORDER BY print_status ASC, created_at ASC`,
       [restaurantId, newTableId]
     );
-    const srcRes = await pool.query(
-      `SELECT id, json_data, instructions
+
+    // Prefer the specific source order (orderId) if provided; otherwise pick a non-printed order
+    const srcResById = await pool.query(
+      `SELECT id, json_data, instructions, print_status
          FROM orders
         WHERE restaurant_id = $1
-          AND table_id      = $2`,
+          AND id            = $2
+          AND table_id      = $3`,
+      [restaurantId, orderId, oldTableId]
+    );
+
+    const srcRes = await pool.query(
+      `SELECT id, json_data, instructions, print_status
+         FROM orders
+        WHERE restaurant_id = $1
+          AND table_id      = $2
+         ORDER BY print_status ASC, created_at ASC`,
       [restaurantId, oldTableId]
     );
 
@@ -433,8 +445,11 @@ const moveTable = async (data) => {
     if (destRes.rows.length > 0 && srcRes.rows.length > 0) {
       // Find the first non-printed order on destination table, or use the first order if all are printed
       const destOrder = destRes.rows.find(order => order.print_status !== true) || destRes.rows[0];
-      const srcOrder  = srcRes.rows[0];
-      
+      const srcOrder  = (srcResById.rows && srcResById.rows[0])
+        || srcRes.rows.find(order => order.print_status !== true)
+        || srcRes.rows[0];
+      console.log("srcOrder", srcOrder);
+      console.log("destOrder", destOrder);
       // 2a. Destination NOT printed → MERGE (your existing logic)
       if (!destOrder.print_status) {
         const existingItems = destOrder.json_data.items || {};
@@ -494,7 +509,7 @@ const moveTable = async (data) => {
               SET table_id   = $1,
                   updated_at = CURRENT_TIMESTAMP
             WHERE id         = $2`,
-          [newTableId, srcRes.rows[0].id]
+          [newTableId, srcOrder.id]
       );
         // (no need to touch notifications here — step 4 handles them)
       }
@@ -506,7 +521,7 @@ const moveTable = async (data) => {
             SET table_id   = $1,
                 updated_at = CURRENT_TIMESTAMP
           WHERE id         = $2`,
-        [newTableId, srcRes.rows[0].id]
+        [newTableId, (srcResById.rows && srcResById.rows[0] ? srcResById.rows[0].id : (srcRes.rows.find(o => o.print_status !== true)?.id || srcRes.rows[0].id))]
       );
     }
 
